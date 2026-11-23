@@ -18,28 +18,42 @@ typedef struct {
   int append;
 } Command;
 
+typedef enum {
+  LEX_SPACE,
+  LEX_WORD,
+} LexState;
+
+typedef enum {
+  PARSE_ARG,
+  PARSE_EXPECT_IN,
+  PARSE_EXPECT_OUT,
+  PARSE_EXPECT_APPEND,
+} ParseState;
+
 int tokenize(char *line, char **argv, int max_args) {
   int argc = 0;
-  char *p = line;
+  LexState state = LEX_SPACE;
 
-  while (*p != '\0' && argc < max_args - 1) {
-    while (*p == ' ' || *p == '\t') {
-      p++;
-    }
-
-    if (*p == '\0') {
+  for (char *p = line; *p != '\0'; p++) {
+    int is_ws = (*p == ' ' || *p == '\t');
+    switch (state) {
+    case LEX_SPACE:
+      if (!is_ws) {
+        if (argc >= max_args - 1) {
+          argv[argc] = NULL;
+          return argc;
+        }
+        argv[argc++] = p;
+        state = LEX_WORD;
+      }
       break;
-    }
 
-    argv[argc++] = p;
-
-    while (*p != '\0' && *p != '\t' && *p != ' ') {
-      p++;
-    }
-
-    if (*p != '\0') {
-      *p = '\0';
-      p++;
+    case LEX_WORD:
+      if (is_ws) {
+        *p = '\0';
+        state = LEX_SPACE;
+      }
+      break;
     }
   }
 
@@ -47,35 +61,97 @@ int tokenize(char *line, char **argv, int max_args) {
   return argc;
 }
 
-int parse_command(char **tokens, int ntokens, Command *cmd) {
+static int is_operator(const char *tok) {
+  return strcmp(tok, "|") == 0 || strcmp(tok, "<") == 0 ||
+         strcmp(tok, ">") == 0 || strcmp(tok, ">>") == 0;
+}
+
+static void command_init(Command *cmd) {
   cmd->argc = 0;
   cmd->in_file = NULL;
   cmd->outfile = NULL;
   cmd->append = 0;
+}
+
+int parse_pipeline(char **tokens, int ntokens, Command *cmds, int max_cmds) {
+  if (ntokens == 0 || max_cmds <= 0) {
+    return 0;
+  }
+
+  ParseState state = PARSE_ARG;
+  int cur = 0;
+  command_init(&cmds[cur]);
+
   for (int i = 0; i < ntokens; i++) {
-    if (strcmp(tokens[i], "<") == 0 || strcmp(tokens[i], ">") == 0 ||
-        strcmp(tokens[i], ">>") == 0) {
-      if (i + 1 >= ntokens) {
-        fprintf(stderr, "syntax error\n");
-        return -1;
-      } else {
-        if (strcmp(tokens[i], "<") == 0) {
-          cmd->in_file = tokens[++i];
-        } else {
-          if (strcmp(tokens[i], ">") == 0) {
-            cmd->append = 0;
-          } else if (strcmp(tokens[i], ">>") == 0) {
-            cmd->append = 1;
-          }
-          cmd->outfile = tokens[++i];
+    char *tok = tokens[i];
+
+    switch (state) {
+    case PARSE_ARG:
+      if (strcmp(tok, "|") == 0) {
+        if (cmds[cur].argc == 0) {
+          fprintf(stderr, "syntax error near '|'\n");
+          return -1;
         }
+        cmds[cur].argv[cmds[cur].argc] = NULL;
+        if (cur + 1 >= max_cmds) {
+          fprintf(stderr, "too many commands in pipeline\n");
+          return -1;
+        }
+        cur++;
+        command_init(&cmds[cur]);
+      } else if (strcmp(tok, "<") == 0) {
+        state = PARSE_EXPECT_IN;
+      } else if (strcmp(tok, ">") == 0) {
+        state = PARSE_EXPECT_OUT;
+      } else if (strcmp(tok, ">>") == 0) {
+        state = PARSE_EXPECT_APPEND;
+      } else if (cmds[cur].argc < MAX_ARGS - 1) {
+        cmds[cur].argv[cmds[cur].argc++] = tok;
       }
-    } else if (cmd->argc < MAX_ARGS - 1) {
-      cmd->argv[cmd->argc++] = tokens[i];
+      break;
+
+    case PARSE_EXPECT_IN:
+      if (is_operator(tok)) {
+        fprintf(stderr, "syntax error near '%s'\n", tok);
+        return -1;
+      }
+      cmds[cur].in_file = tok;
+      state = PARSE_ARG;
+      break;
+
+    case PARSE_EXPECT_OUT:
+      if (is_operator(tok)) {
+        fprintf(stderr, "syntax error near '%s'\n", tok);
+        return -1;
+      }
+      cmds[cur].outfile = tok;
+      cmds[cur].append = 0;
+      state = PARSE_ARG;
+      break;
+
+    case PARSE_EXPECT_APPEND:
+      if (is_operator(tok)) {
+        fprintf(stderr, "syntax error near '%s'\n", tok);
+        return -1;
+      }
+      cmds[cur].outfile = tok;
+      cmds[cur].append = 1;
+      state = PARSE_ARG;
+      break;
     }
   }
-  cmd->argv[cmd->argc] = NULL;
-  return 0;
+
+  if (state != PARSE_ARG) {
+    fprintf(stderr, "syntax error: missing filename\n");
+    return -1;
+  }
+  if (cmds[cur].argc == 0) {
+    fprintf(stderr, "syntax error: empty command\n");
+    return -1;
+  }
+
+  cmds[cur].argv[cmds[cur].argc] = NULL;
+  return cur + 1;
 }
 
 void apply_redirection(const Command *cmd) {
@@ -108,46 +184,55 @@ void apply_redirection(const Command *cmd) {
   }
 }
 
+static void reap_children(const pid_t *pids, int count) {
+  for (int i = 0; i < count; i++) {
+    int status;
+    while (waitpid(pids[i], &status, 0) == -1 && errno == EINTR) {
+    }
+  }
+}
+
 void execute_pipeline(const Command *cmds, int ncmds) {
   pid_t pids[MAX_CMDS] = {0};
   int prev_fd = -1;
+
   for (int i = 0; i < ncmds; i++) {
+    int has_prev = (prev_fd != -1);
+    int has_next = (i < ncmds - 1);
     int pipefd[2] = {-1, -1};
-    if (i < ncmds - 1 && pipe(pipefd) == -1) {
+
+    if (has_next && pipe(pipefd) == -1) {
       perror("pipe");
-      if (prev_fd != -1)
+      if (has_prev) {
         close(prev_fd);
-      for (int j = 0; j < i; j++) {
-        while (waitpid(pids[j], NULL, 0) == -1 && errno == EINTR) {
-        }
       }
+      reap_children(pids, i);
       return;
     }
+
     pid_t pid = fork();
     if (pid < 0) {
       perror("fork");
-      if (prev_fd != -1) {
+      if (has_prev) {
         close(prev_fd);
       }
-      if (i < ncmds - 1) {
+      if (has_next) {
         close(pipefd[0]);
         close(pipefd[1]);
       }
-      for (int j = 0; j < i; j++) {
-        while (waitpid(pids[j], NULL, 0) == -1 && errno == EINTR) {
-        }
-      }
+      reap_children(pids, i);
       return;
     }
+
     if (pid == 0) {
-      if (prev_fd != -1) {
+      if (has_prev) {
         if (dup2(prev_fd, STDIN_FILENO) < 0) {
           perror("dup2");
           _exit(1);
         }
         close(prev_fd);
       }
-      if (i < ncmds - 1) {
+      if (has_next) {
         close(pipefd[0]);
         if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
           perror("dup2");
@@ -164,47 +249,19 @@ void execute_pipeline(const Command *cmds, int ncmds) {
       execvp(cmds[i].argv[0], cmds[i].argv);
       perror(cmds[i].argv[0]);
       _exit(127);
-    } else if (pid > 0) {
-      pids[i] = pid;
-      if (prev_fd != -1) {
-        close(prev_fd);
-      }
-      if (i < ncmds - 1) {
-        close(pipefd[1]);
-        prev_fd = pipefd[0];
-      }
     }
-  }
-  for (int i = 0; i < ncmds; i++) {
-    int status;
-    while (waitpid(pids[i], &status, 0) == -1 && errno == EINTR) {
-    }
-  }
-}
-int parse_pipeline(char **tokens, int ntokens, Command *cmds, int max_cmds) {
-  int start = 0;
-  int ncmds = 0;
 
-  for (int i = 0; i <= ntokens; i++) {
-    if (i == ntokens || strcmp(tokens[i], "|") == 0) {
-      int len = i - start;
-      if (len == 0) {
-        fprintf(stderr, "syntax error\n");
-        return -1;
-      }
-      if (ncmds >= max_cmds) {
-        fprintf(stderr, "too many commands in pipeline\n");
-        return -1;
-      }
-      if (parse_command(tokens + start, len, &cmds[ncmds]) != 0 ||
-          cmds[ncmds].argc == 0) {
-        return -1;
-      }
-      ncmds++;
-      start = i + 1;
+    pids[i] = pid;
+    if (has_prev) {
+      close(prev_fd);
+    }
+    if (has_next) {
+      close(pipefd[1]);
+      prev_fd = pipefd[0];
     }
   }
-  return ncmds;
+
+  reap_children(pids, ncmds);
 }
 
 void handle_sigint(int sig) {
