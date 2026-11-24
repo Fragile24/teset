@@ -10,12 +10,19 @@
 
 #define MAX_ARGS 64
 #define MAX_CMDS 16
+
+typedef enum {
+  OUT_NONE,
+  OUT_TRUNC,
+  OUT_APPEND,
+} OutputMode;
+
 typedef struct {
   char *argv[MAX_ARGS];
   int argc;
   char *in_file;
   char *outfile;
-  int append;
+  OutputMode out_mode;
 } Command;
 
 typedef enum {
@@ -29,6 +36,33 @@ typedef enum {
   PARSE_EXPECT_OUT,
   PARSE_EXPECT_APPEND,
 } ParseState;
+
+typedef enum {
+  PIPE_SINGLE,
+  PIPE_FIRST,
+  PIPE_MIDDLE,
+  PIPE_LAST,
+} PipeRole;
+
+typedef enum {
+  EXEC_PREPARE_STAGE,
+  EXEC_FORK_STAGE,
+  EXEC_REAP,
+  EXEC_DONE,
+} ExecState;
+
+typedef enum {
+  SHELL_READ,
+  SHELL_PARSE,
+  SHELL_DISPATCH,
+  SHELL_EXIT,
+} ShellState;
+
+typedef enum {
+  BUILTIN_NONE,
+  BUILTIN_EXIT,
+  BUILTIN_CD,
+} BuiltinKind;
 
 int tokenize(char *line, char **argv, int max_args) {
   int argc = 0;
@@ -70,7 +104,7 @@ static void command_init(Command *cmd) {
   cmd->argc = 0;
   cmd->in_file = NULL;
   cmd->outfile = NULL;
-  cmd->append = 0;
+  cmd->out_mode = OUT_NONE;
 }
 
 int parse_pipeline(char **tokens, int ntokens, Command *cmds, int max_cmds) {
@@ -125,7 +159,7 @@ int parse_pipeline(char **tokens, int ntokens, Command *cmds, int max_cmds) {
         return -1;
       }
       cmds[cur].outfile = tok;
-      cmds[cur].append = 0;
+      cmds[cur].out_mode = OUT_TRUNC;
       state = PARSE_ARG;
       break;
 
@@ -135,7 +169,7 @@ int parse_pipeline(char **tokens, int ntokens, Command *cmds, int max_cmds) {
         return -1;
       }
       cmds[cur].outfile = tok;
-      cmds[cur].append = 1;
+      cmds[cur].out_mode = OUT_APPEND;
       state = PARSE_ARG;
       break;
     }
@@ -168,20 +202,51 @@ void apply_redirection(const Command *cmd) {
     }
     close(fd);
   }
-  if (cmd->outfile != NULL) {
-    int flags = O_WRONLY | O_CREAT | (cmd->append ? O_APPEND : O_TRUNC);
-    int fd = open(cmd->outfile, flags, 0644);
-    if (fd < 0) {
-      perror(cmd->outfile);
-      _exit(1);
-    }
-    if (dup2(fd, STDOUT_FILENO) < 0) {
-      perror("dup2");
-      close(fd);
-      _exit(1);
-    }
-    close(fd);
+
+  int out_flags = 0;
+  switch (cmd->out_mode) {
+  case OUT_NONE:
+    return;
+  case OUT_TRUNC:
+    out_flags = O_WRONLY | O_CREAT | O_TRUNC;
+    break;
+  case OUT_APPEND:
+    out_flags = O_WRONLY | O_CREAT | O_APPEND;
+    break;
   }
+
+  int fd = open(cmd->outfile, out_flags, 0644);
+  if (fd < 0) {
+    perror(cmd->outfile);
+    _exit(1);
+  }
+  if (dup2(fd, STDOUT_FILENO) < 0) {
+    perror("dup2");
+    close(fd);
+    _exit(1);
+  }
+  close(fd);
+}
+
+static PipeRole classify_pipe_role(int index, int ncmds) {
+  if (ncmds <= 1) {
+    return PIPE_SINGLE;
+  }
+  if (index == 0) {
+    return PIPE_FIRST;
+  }
+  if (index == ncmds - 1) {
+    return PIPE_LAST;
+  }
+  return PIPE_MIDDLE;
+}
+
+static int role_has_prev(PipeRole role) {
+  return role == PIPE_MIDDLE || role == PIPE_LAST;
+}
+
+static int role_has_next(PipeRole role) {
+  return role == PIPE_FIRST || role == PIPE_MIDDLE;
 }
 
 static void reap_children(const pid_t *pids, int count) {
@@ -194,74 +259,101 @@ static void reap_children(const pid_t *pids, int count) {
 
 void execute_pipeline(const Command *cmds, int ncmds) {
   pid_t pids[MAX_CMDS] = {0};
+  ExecState state = EXEC_PREPARE_STAGE;
+  PipeRole role = PIPE_SINGLE;
+  int stage = 0;
+  int spawned = 0;
   int prev_fd = -1;
+  int pipefd[2] = {-1, -1};
 
-  for (int i = 0; i < ncmds; i++) {
-    int has_prev = (prev_fd != -1);
-    int has_next = (i < ncmds - 1);
-    int pipefd[2] = {-1, -1};
-
-    if (has_next && pipe(pipefd) == -1) {
-      perror("pipe");
-      if (has_prev) {
-        close(prev_fd);
+  while (state != EXEC_DONE) {
+    switch (state) {
+    case EXEC_PREPARE_STAGE:
+      if (stage >= ncmds) {
+        state = EXEC_REAP;
+        break;
       }
-      reap_children(pids, i);
-      return;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-      perror("fork");
-      if (has_prev) {
-        close(prev_fd);
-      }
-      if (has_next) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-      }
-      reap_children(pids, i);
-      return;
-    }
-
-    if (pid == 0) {
-      if (has_prev) {
-        if (dup2(prev_fd, STDIN_FILENO) < 0) {
-          perror("dup2");
-          _exit(1);
+      role = classify_pipe_role(stage, ncmds);
+      pipefd[0] = -1;
+      pipefd[1] = -1;
+      if (role_has_next(role) && pipe(pipefd) == -1) {
+        perror("pipe");
+        if (prev_fd != -1) {
+          close(prev_fd);
+          prev_fd = -1;
         }
-        close(prev_fd);
+        state = EXEC_REAP;
+        break;
       }
-      if (has_next) {
-        close(pipefd[0]);
-        if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
-          perror("dup2");
-          _exit(1);
+      state = EXEC_FORK_STAGE;
+      break;
+
+    case EXEC_FORK_STAGE: {
+      pid_t pid = fork();
+      if (pid < 0) {
+        perror("fork");
+        if (prev_fd != -1) {
+          close(prev_fd);
+          prev_fd = -1;
         }
-        close(pipefd[1]);
+        if (role_has_next(role)) {
+          close(pipefd[0]);
+          close(pipefd[1]);
+        }
+        state = EXEC_REAP;
+        break;
       }
-      apply_redirection(&cmds[i]);
-      struct sigaction sa = {0};
-      sa.sa_handler = SIG_DFL;
-      sigemptyset(&sa.sa_mask);
-      sa.sa_flags = 0;
-      sigaction(SIGINT, &sa, NULL);
-      execvp(cmds[i].argv[0], cmds[i].argv);
-      perror(cmds[i].argv[0]);
-      _exit(127);
+
+      if (pid == 0) {
+        if (role_has_prev(role)) {
+          if (dup2(prev_fd, STDIN_FILENO) < 0) {
+            perror("dup2");
+            _exit(1);
+          }
+          close(prev_fd);
+        }
+        if (role_has_next(role)) {
+          close(pipefd[0]);
+          if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
+            perror("dup2");
+            _exit(1);
+          }
+          close(pipefd[1]);
+        }
+        apply_redirection(&cmds[stage]);
+        struct sigaction sa = {0};
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT, &sa, NULL);
+        execvp(cmds[stage].argv[0], cmds[stage].argv);
+        perror(cmds[stage].argv[0]);
+        _exit(127);
+      }
+
+      pids[spawned++] = pid;
+      if (role_has_prev(role)) {
+        close(prev_fd);
+        prev_fd = -1;
+      }
+      if (role_has_next(role)) {
+        close(pipefd[1]);
+        prev_fd = pipefd[0];
+      }
+      stage++;
+      state = EXEC_PREPARE_STAGE;
+      break;
     }
 
-    pids[i] = pid;
-    if (has_prev) {
-      close(prev_fd);
-    }
-    if (has_next) {
-      close(pipefd[1]);
-      prev_fd = pipefd[0];
+    case EXEC_REAP:
+      reap_children(pids, spawned);
+      state = EXEC_DONE;
+      break;
+
+    case EXEC_DONE:
+      break;
     }
   }
-
-  reap_children(pids, ncmds);
 }
 
 void handle_sigint(int sig) {
@@ -270,57 +362,92 @@ void handle_sigint(int sig) {
   (void)n;
 }
 
+static BuiltinKind classify_builtin(const Command *cmds, int ncmds) {
+  if (ncmds != 1) {
+    return BUILTIN_NONE;
+  }
+  if (strcmp(cmds[0].argv[0], "exit") == 0) {
+    return BUILTIN_EXIT;
+  }
+  if (strcmp(cmds[0].argv[0], "cd") == 0) {
+    return BUILTIN_CD;
+  }
+  return BUILTIN_NONE;
+}
+
 int main(void) {
   char str[200];
   char *argv[MAX_ARGS];
+  Command cmds[MAX_CMDS];
+  int ncmds = 0;
 
   struct sigaction sa = {0};
-
   sa.sa_handler = handle_sigint;
   sigemptyset(&sa.sa_mask);
-
   sa.sa_flags = 0;
-
   sigaction(SIGINT, &sa, NULL);
 
-  while (1) {
-    printf("mysh> ");
-    fflush(stdout);
-    errno = 0;
-    if (fgets(str, sizeof(str), stdin) == NULL) {
-      if (errno == EINTR) {
-        clearerr(stdin);
-        continue;
-      } else {
-        puts("end of file");
-        return 0;
+  ShellState state = SHELL_READ;
+  while (state != SHELL_EXIT) {
+    switch (state) {
+    case SHELL_READ:
+      printf("mysh> ");
+      fflush(stdout);
+      errno = 0;
+      if (fgets(str, sizeof(str), stdin) == NULL) {
+        if (errno == EINTR) {
+          clearerr(stdin);
+          state = SHELL_READ;
+        } else {
+          puts("end of file");
+          state = SHELL_EXIT;
+        }
+        break;
       }
+      state = SHELL_PARSE;
+      break;
+
+    case SHELL_PARSE: {
+      size_t len = strlen(str);
+      if (len > 0 && str[len - 1] == '\n') {
+        str[len - 1] = '\0';
+      }
+      int argc = tokenize(str, argv, MAX_ARGS);
+      if (argc == 0) {
+        state = SHELL_READ;
+        break;
+      }
+      ncmds = parse_pipeline(argv, argc, cmds, MAX_CMDS);
+      state = (ncmds > 0) ? SHELL_DISPATCH : SHELL_READ;
+      break;
     }
-    size_t len = strlen(str);
-    if (len > 0 && str[len - 1] == '\n') {
-      str[len - 1] = '\0';
-    }
-    int argc = tokenize(str, argv, MAX_ARGS);
-    if (argc == 0) {
-      continue;
-    }
-    Command cmds[MAX_CMDS];
-    int ncmds = parse_pipeline(argv, argc, cmds, MAX_CMDS);
-    if (ncmds <= 0) {
-      continue;
-    }
-    if (ncmds == 1) {
-      if (strcmp(cmds[0].argv[0], "exit") == 0) {
-        return 0;
-      } else if (strcmp(cmds[0].argv[0], "cd") == 0) {
+
+    case SHELL_DISPATCH:
+      switch (classify_builtin(cmds, ncmds)) {
+      case BUILTIN_EXIT:
+        state = SHELL_EXIT;
+        break;
+
+      case BUILTIN_CD:
         if (cmds[0].argc < 2) {
           fprintf(stderr, "cd: missing argument\n");
         } else if (chdir(cmds[0].argv[1]) == -1) {
           perror("cd");
         }
-        continue;
+        state = SHELL_READ;
+        break;
+
+      case BUILTIN_NONE:
+        execute_pipeline(cmds, ncmds);
+        state = SHELL_READ;
+        break;
       }
+      break;
+
+    case SHELL_EXIT:
+      break;
     }
-    execute_pipeline(cmds, ncmds);
   }
+
+  return 0;
 }
